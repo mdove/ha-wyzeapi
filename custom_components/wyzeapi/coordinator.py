@@ -12,6 +12,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from wyzeapy.services.lock_service import LockService, Lock
+from wyzeapy.services.thermostat_service import (
+    RoomSensor,
+    Thermostat,
+    ThermostatService,
+)
 
 from .const import YDBLE_LOCK_STATE_UUID, YDBLE_UART_RX_UUID, YDBLE_UART_TX_UUID
 from .token_manager import token_exception_handler
@@ -194,3 +199,37 @@ class WyzeLockBoltCoordinator(DataUpdateCoordinator):
             await self._bleak_client.disconnect()
         self._current_command = None
         self.async_update_listeners()
+
+
+class WyzeRoomSensorsCoordinator(DataUpdateCoordinator):
+    """Polls a single Wyze thermostat for its paired room sensors.
+
+    Per-thermostat coordinator so we make ONE round-trip per thermostat
+    per cycle, not one per sensor. Entities read sensors from
+    coordinator.data[sensor_mac] -> RoomSensor.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        thermostat_service: ThermostatService,
+        thermostat: Thermostat,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"Wyze Room Sensors ({thermostat.nickname})",
+            update_interval=timedelta(seconds=60),
+        )
+        self._thermostat_service = thermostat_service
+        self._thermostat = thermostat
+
+    async def _async_update_data(self) -> Dict[str, RoomSensor]:
+        try:
+            sensors = await self._thermostat_service.get_room_sensors(self._thermostat)
+        except Exception as err:
+            raise UpdateFailed(
+                f"Error fetching room sensors for "
+                f"{self._thermostat.nickname}: {err}"
+            ) from err
+        return {s.mac: s for s in sensors}
