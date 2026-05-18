@@ -11,6 +11,7 @@ from wyzeapy.services.camera_service import Camera
 from wyzeapy.services.irrigation_service import Irrigation, IrrigationService
 from wyzeapy.services.lock_service import Lock
 from wyzeapy.services.switch_service import Switch, SwitchUsageService
+from wyzeapy.services.thermostat_service import RoomSensorBattery
 
 from homeassistant.components.sensor import (
     RestoreSensor,
@@ -22,6 +23,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_ATTRIBUTION,
     PERCENTAGE,
+    UnitOfTemperature,
     EntityCategory,
     UnitOfEnergy,
 )
@@ -34,6 +36,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
 )
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     CAMERA_UPDATED,
@@ -42,6 +45,7 @@ from .const import (
     LOCK_UPDATED,
     RESET_BUTTON_PRESSED,
 )
+from .coordinator import WyzeRoomSensorsCoordinator
 from .token_manager import token_exception_handler
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,6 +113,22 @@ async def async_setup_entry(
                 WyzeIrrigationSSID(irrigation_service, device),
             ]
         )
+
+    # Wyze thermostat room sensors (paired Climate Sensors).
+    # One coordinator per thermostat; each sensor surfaces 3 HA entities
+    # (temperature, humidity, battery).
+    thermostat_service = await client.thermostat_service
+    for thermostat in await thermostat_service.get_thermostats():
+        coordinator = WyzeRoomSensorsCoordinator(hass, thermostat_service, thermostat)
+        await coordinator.async_config_entry_first_refresh()
+        for sensor_mac, sensor in (coordinator.data or {}).items():
+            sensors.extend(
+                [
+                    WyzeRoomSensorTemperature(coordinator, thermostat, sensor_mac),
+                    WyzeRoomSensorHumidity(coordinator, thermostat, sensor_mac),
+                    WyzeRoomSensorBattery(coordinator, thermostat, sensor_mac),
+                ]
+            )
 
     async_add_entities(sensors, True)
 
@@ -624,3 +644,133 @@ class WyzeIrrigationSSID(WyzeIrrigationBaseSensor):
     def native_value(self) -> str:
         """Return the SSID."""
         return self._device.ssid
+
+
+# =====================================================================
+# Wyze Room Sensors (Climate Sensors paired with a Wyze Thermostat)
+# =====================================================================
+
+_BATTERY_LEVEL_TO_PERCENT = {
+    RoomSensorBattery.EMPTY: 0,
+    RoomSensorBattery.LOW: 25,
+    RoomSensorBattery.HALF: 50,
+    RoomSensorBattery.FULL: 100,
+}
+
+
+class _WyzeRoomSensorBase(CoordinatorEntity, SensorEntity):
+    """Common scaffolding for room-sensor child entities.
+
+    The coordinator polls the parent thermostat once per cycle and stores a
+    dict keyed by sensor MAC. Each entity looks itself up by its MAC.
+    """
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+    _attr_attribution = ATTRIBUTION
+
+    def __init__(self, coordinator, thermostat, sensor_mac: str) -> None:
+        super().__init__(coordinator)
+        self._thermostat = thermostat
+        self._sensor_mac = sensor_mac
+
+    @property
+    def _sensor(self):
+        """Current RoomSensor from coordinator cache (may be None mid-refresh)."""
+        return (self.coordinator.data or {}).get(self._sensor_mac)
+
+    @property
+    def _nickname(self) -> str:
+        s = self._sensor
+        return s.nickname if s and s.nickname else self._sensor_mac
+
+    @property
+    def available(self) -> bool:
+        return self._sensor is not None and super().available
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._sensor_mac)},
+            name=self._nickname,
+            manufacturer="Wyze",
+            model="Wyze Room Sensor",
+            via_device=(DOMAIN, self._thermostat.mac),
+        )
+
+
+class WyzeRoomSensorTemperature(_WyzeRoomSensorBase):
+    """Temperature reading from a Wyze room sensor."""
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_translation_key = "room_sensor_temperature"
+
+    def __init__(self, coordinator, thermostat, sensor_mac: str) -> None:
+        super().__init__(coordinator, thermostat, sensor_mac)
+        self._attr_unique_id = f"{sensor_mac}.temperature"
+
+    @property
+    def name(self) -> str:
+        return "Temperature"
+
+    @property
+    def native_value(self):
+        s = self._sensor
+        return s.temperature if s else None
+
+
+class WyzeRoomSensorHumidity(_WyzeRoomSensorBase):
+    """Humidity reading from a Wyze room sensor."""
+
+    _attr_device_class = SensorDeviceClass.HUMIDITY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_translation_key = "room_sensor_humidity"
+
+    def __init__(self, coordinator, thermostat, sensor_mac: str) -> None:
+        super().__init__(coordinator, thermostat, sensor_mac)
+        self._attr_unique_id = f"{sensor_mac}.humidity"
+
+    @property
+    def name(self) -> str:
+        return "Humidity"
+
+    @property
+    def native_value(self):
+        s = self._sensor
+        return s.humidity if s else None
+
+
+class WyzeRoomSensorBattery(_WyzeRoomSensorBase):
+    """Battery level (0/25/50/100 %) from a Wyze room sensor."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "room_sensor_battery"
+
+    def __init__(self, coordinator, thermostat, sensor_mac: str) -> None:
+        super().__init__(coordinator, thermostat, sensor_mac)
+        self._attr_unique_id = f"{sensor_mac}.battery"
+
+    @property
+    def name(self) -> str:
+        return "Battery"
+
+    @property
+    def native_value(self):
+        s = self._sensor
+        if s is None:
+            return None
+        return _BATTERY_LEVEL_TO_PERCENT.get(s.battery)
+
+    @property
+    def extra_state_attributes(self):
+        s = self._sensor
+        return {
+            ATTR_ATTRIBUTION: ATTRIBUTION,
+            "battery_level_raw": s.battery.name if s else "UNKNOWN",
+        }
